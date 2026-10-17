@@ -1,1 +1,1229 @@
+name: build-apk
 
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  LOGDIR: ${{ runner.temp }}/logs
+  NDK_VERSION: 26.1.10909125
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Android SDK + NDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platforms;android-35 build-tools;35.0.0 ndk;26.1.10909125'
+
+      - name: Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Preflight
+        run: |
+          set -x
+          mkdir -p "$LOGDIR"
+          set -o pipefail
+          {
+            fail=0
+            [ -n "${ANDROID_HOME:-}" ]     || { echo "::error::ANDROID_HOME is empty"; fail=1; }
+            [ -n "${ANDROID_SDK_ROOT:-}" ] || { echo "::error::ANDROID_SDK_ROOT is empty"; fail=1; }
+            TC="${ANDROID_HOME:-/nonexistent}/ndk/${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+            [ -x "$TC/clang" ]      || { echo "::error::NDK clang missing at $TC/clang"; ls -la "${ANDROID_HOME:-/nonexistent}/ndk" 2>&1 || true; fail=1; }
+            [ -x "$TC/llvm-strip" ] || { echo "::error::NDK llvm-strip missing at $TC/llvm-strip"; fail=1; }
+            [ -d "${ANDROID_HOME:-/nonexistent}/platforms/android-35" ] || { echo "::error::platform android-35 missing"; fail=1; }
+            command -v gcc >/dev/null || { echo "::error::gcc not found"; fail=1; }
+            command -v gradle >/dev/null || { echo "::error::gradle not on PATH"; fail=1; }
+            command -v gradle >/dev/null && { gradle --version 2>/dev/null | grep -q '8\.10\.2' || { echo "::error::gradle is not 8.10.2"; fail=1; }; }
+            echo "ANDROID_HOME=$ANDROID_HOME"
+            echo "NDK_TOOLCHAIN=$TC"
+            exit $fail
+          } 2>&1 | tee "$LOGDIR/01-preflight.log"
+
+      - name: Keystore
+        run: |
+          set -x
+          {
+            mkdir -p ~/.android
+            keytool -genkeypair -v -keystore ~/.android/debug.keystore \
+              -storepass android -alias androiddebugkey -keypass android \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          } 2>&1 | tee "$LOGDIR/02-keystore.log"
+
+      - name: Scaffold
+        run: |
+          set -x
+          {
+            mkdir -p app/src/main/java/ai/venice/vnx app/src/main/cpp \
+                     app/src/main/res/drawable app/src/main/res/values \
+                     app/src/main/res/mipmap-anydpi app/src/main/res/mipmap-anydpi-v26 \
+                     app/src/main/assets
+            echo "sdk.dir=$ANDROID_HOME" > local.properties
+
+            cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "VNX"
+          include(":app")
+          EOF
+
+            cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.7.0" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.21" apply false
+          }
+          EOF
+
+            cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=1g
+          org.gradle.parallel=true
+          org.gradle.caching=true
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          EOF
+
+            cat > app/proguard-rules.pro <<'EOF'
+          -keep class rikka.shizuku.** { *; }
+          -keep class moe.shizuku.** { *; }
+          -dontwarn rikka.shizuku.**
+          -dontwarn moe.shizuku.**
+          -dontwarn androidx.compose.**
+          EOF
+
+            cat > app/build.gradle.kts <<'EOF'
+          import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+          }
+
+          android {
+              namespace = "ai.venice.vnx"
+              compileSdk = 35
+
+              defaultConfig {
+                  applicationId = "ai.venice.vnx"
+                  minSdk = 24
+                  targetSdk = 35
+                  versionCode = 8
+                  versionName = "1.7"
+              }
+
+              buildTypes {
+                  getByName("debug") {
+                      isMinifyEnabled = false
+                  }
+                  getByName("release") {
+                      isMinifyEnabled = true
+                      proguardFiles(
+                          getDefaultProguardFile("proguard-android-optimize.txt"),
+                          "proguard-rules.pro"
+                      )
+                      signingConfig = signingConfigs.getByName("debug")
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              buildFeatures { compose = true }
+          }
+
+          kotlin {
+              compilerOptions {
+                  jvmTarget.set(JvmTarget.JVM_17)
+              }
+          }
+
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.10.01"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.foundation:foundation")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.activity:activity-compose:1.9.3")
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("dev.rikka.shizuku:api:13.1.5")
+              implementation("dev.rikka.shizuku:provider:13.1.5")
+          }
+          EOF
+
+            cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <uses-permission android:name="android.permission.WAKE_LOCK"/>
+              <uses-permission android:name="moe.shizuku.manager.permission.API_V23"/>
+
+              <queries>
+                  <package android:name="moe.shizuku.privileged.api"/>
+                  <package android:name="com.dts.freefireth"/>
+                  <package android:name="com.dts.freefiremax"/>
+              </queries>
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher"
+                  android:label="VNX Apex"
+                  android:hardwareAccelerated="true"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTop"
+                      android:windowSoftInputMode="adjustResize"
+                      android:configChanges="orientation|screenSize|keyboardHidden|uiMode">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".OverlaySvc"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="game memory overlay"/>
+                  </service>
+
+                  <provider
+                      android:name="rikka.shizuku.ShizukuProvider"
+                      android:authorities="${applicationId}.shizuku"
+                      android:enabled="true"
+                      android:exported="true"
+                      android:multiprocess="false"
+                      android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"/>
+              </application>
+          </manifest>
+          EOF
+
+            cat > app/src/main/res/values/colors.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="ic_launcher_background">#0B0E13</color>
+          </resources>
+          EOF
+
+            cat > app/src/main/res/drawable/ic_launcher.xml <<'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp" android:height="108dp"
+              android:viewportWidth="108" android:viewportHeight="108">
+              <path android:fillColor="#0B0E13" android:pathData="M0,0h108v108h-108z"/>
+              <path android:fillColor="#39FF88" android:pathData="M54,22a32,32 0 1,0 0,64a32,32 0 1,0 0,-64z"/>
+              <path android:fillColor="#0B0E13" android:pathData="M54,31a23,23 0 1,0 0,46a23,23 0 1,0 0,-46z"/>
+              <path android:fillColor="#39FF88" android:pathData="M51,10h6v32h-6z M51,66h6v32h-6z M10,51h32v6h-32z M66,51h32v6h-32z"/>
+              <path android:fillColor="#FF3D71" android:pathData="M51,51h6v6h-6z"/>
+          </vector>
+          EOF
+
+            cat > app/src/main/res/drawable/ic_launcher_foreground.xml <<'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp" android:height="108dp"
+              android:viewportWidth="108" android:viewportHeight="108">
+              <group android:scaleX="0.6667" android:scaleY="0.6667"
+                     android:pivotX="54" android:pivotY="54">
+                  <path android:fillColor="#39FF88" android:pathData="M54,22a32,32 0 1,0 0,64a32,32 0 1,0 0,-64z"/>
+                  <path android:fillColor="#0B0E13" android:pathData="M54,31a23,23 0 1,0 0,46a23,23 0 1,0 0,-46z"/>
+                  <path android:fillColor="#39FF88" android:pathData="M51,10h6v32h-6z M51,66h6v32h-6z M10,51h32v6h-32z M66,51h32v6h-32z"/>
+                  <path android:fillColor="#FF3D71" android:pathData="M51,51h6v6h-6z"/>
+              </group>
+          </vector>
+          EOF
+
+            cat > app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_launcher_background"/>
+              <foreground android:drawable="@drawable/ic_launcher_foreground"/>
+              <monochrome android:drawable="@drawable/ic_launcher_foreground"/>
+          </adaptive-icon>
+          EOF
+
+            cat > app/src/main/res/mipmap-anydpi/ic_launcher.xml <<'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp" android:height="108dp"
+              android:viewportWidth="108" android:viewportHeight="108">
+              <path android:fillColor="#0B0E13" android:pathData="M0,0h108v108h-108z"/>
+              <path android:fillColor="#39FF88" android:pathData="M54,22a32,32 0 1,0 0,64a32,32 0 1,0 0,-64z"/>
+              <path android:fillColor="#0B0E13" android:pathData="M54,31a23,23 0 1,0 0,46a23,23 0 1,0 0,-46z"/>
+              <path android:fillColor="#39FF88" android:pathData="M51,10h6v32h-6z M51,66h6v32h-6z M10,51h32v6h-32z M66,51h32v6h-32z"/>
+              <path android:fillColor="#FF3D71" android:pathData="M51,51h6v6h-6z"/>
+          </vector>
+          EOF
+
+            cat > app/src/main/java/ai/venice/vnx/ShizukuGate.kt <<'EOF'
+          package ai.venice.vnx
+
+          import android.content.pm.PackageManager
+          import androidx.activity.ComponentActivity
+          import rikka.shizuku.Shizuku
+
+          object ShizukuGate {
+              private const val REQ = 1337
+              private var attached = false
+
+              fun attach(a: ComponentActivity) {
+                  if (attached) return
+                  attached = true
+                  runCatching {
+                      Shizuku.addRequestPermissionResultListener { id, _ -> if (id == REQ) Unit }
+                  }
+              }
+
+              fun alive(): Boolean = runCatching { Shizuku.pingBinder() }.getOrDefault(false)
+
+              fun granted(): Boolean = runCatching {
+                  alive() && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+              }.getOrDefault(false)
+
+              fun request() {
+                  runCatching {
+                      if (!alive()) return@runCatching
+                      if (Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) return@runCatching
+                      if (Shizuku.shouldShowRequestPermissionRationale()) return@runCatching
+                      Shizuku.requestPermission(REQ)
+                  }
+              }
+          }
+          EOF
+
+            cat > app/src/main/java/ai/venice/vnx/Shell.kt <<'EOF'
+          package ai.venice.vnx
+
+          import rikka.shizuku.Shizuku
+
+          object Shell {
+              private const val MARK = "__VNX_EOF_9F3A__"
+              private val lock = Any()
+              private var proc: Process? = null
+
+              private fun warm(): Process? {
+                  proc?.let { if (it.isAlive) return it }
+                  proc = null
+                  if (!ShizukuGate.granted()) return null
+                  val p = runCatching { Shizuku.newProcess(arrayOf("sh"), null, null) }.getOrNull()
+                      ?: return null
+                  proc = p
+                  runCatching {
+                      p.outputStream.write("echo ready\n".toByteArray())
+                      p.outputStream.flush()
+                      val buf = ByteArray(256)
+                      val deadline = System.currentTimeMillis() + 600L
+                      while (System.currentTimeMillis() < deadline) {
+                          if (p.inputStream.available() > 0) { p.inputStream.read(buf); break }
+                          Thread.sleep(5)
+                      }
+                  }
+                  return p
+              }
+
+              private fun drop() {
+                  runCatching { proc?.destroy() }
+                  proc = null
+              }
+
+              fun exec(cmd: String, timeoutMs: Long = 90_000L): String = synchronized(lock) {
+                  val p = warm() ?: return@synchronized "! shizuku not available"
+                  try {
+                      p.outputStream.write("$cmd 2>&1; echo $MARK\n".toByteArray())
+                      p.outputStream.flush()
+                  } catch (e: Exception) {
+                      drop()
+                      return@synchronized "! shell write failed: ${e.message}"
+                  }
+                  val sb = StringBuilder()
+                  val buf = ByteArray(8192)
+                  val deadline = System.currentTimeMillis() + timeoutMs
+                  while (true) {
+                      try {
+                          if (p.inputStream.available() > 0) {
+                              val n = p.inputStream.read(buf)
+                              if (n <= 0) { drop(); return@synchronized "! shell closed" }
+                              sb.append(String(buf, 0, n))
+                              val s = sb.toString()
+                              val i = s.indexOf(MARK)
+                              if (i >= 0) return@synchronized s.substring(0, i).trim()
+                          } else {
+                              if (!p.isAlive) {
+                                  drop()
+                                  val s = sb.toString().trim()
+                                  return@synchronized if (s.isEmpty()) "! shell closed" else s
+                              }
+                              if (System.currentTimeMillis() > deadline) {
+                                  return@synchronized "! timeout ${timeoutMs}ms: $cmd"
+                              }
+                              Thread.sleep(5)
+                          }
+                      } catch (e: Exception) {
+                          drop()
+                          return@synchronized "! shell read failed: ${e.message}"
+                      }
+                  }
+                  ""
+              }
+          }
+          EOF
+
+            cat > app/src/main/java/ai/venice/vnx/Auth.kt <<'EOF'
+          package ai.venice.vnx
+
+          import android.content.Context
+          import java.security.MessageDigest
+
+          object Auth {
+              private const val SALT = "vnx-apex-9f3a"
+              private const val USER = "venice"
+              private const val PASS = "venice"
+
+              private fun p(c: Context) = c.getSharedPreferences("vnx", Context.MODE_PRIVATE)
+
+              private fun h(s: String): String =
+                  MessageDigest.getInstance("SHA-256")
+                      .digest((SALT + s).toByteArray())
+                      .joinToString("") { "%02x".format(it) }
+
+              fun seed(c: Context) {
+                  val sp = p(c)
+                  if (!sp.contains("u")) sp.edit().putString("u", USER).putString("h", h(PASS)).apply()
+              }
+
+              fun verify(c: Context, user: String, pass: String): Boolean {
+                  seed(c)
+                  val sp = p(c)
+                  return sp.getString("u", "") == user.trim() && sp.getString("h", "") == h(pass)
+              }
+
+              fun loggedIn(c: Context) = p(c).getBoolean("in", false)
+              fun login(c: Context) { p(c).edit().putBoolean("in", true).apply() }
+              fun logout(c: Context) { p(c).edit().putBoolean("in", false).apply() }
+          }
+          EOF
+
+            cat > app/src/main/java/ai/venice/vnx/Native.kt <<'EOF'
+          package ai.venice.vnx
+
+          import android.content.Context
+          import android.os.Build
+          import rikka.shizuku.Shizuku
+
+          object Native {
+              const val DIR = "/data/local/tmp/vnx"
+              const val BIN = "$DIR/vnxmem"
+              private val installed = HashSet<String>()
+
+              private fun abis(ctx: Context): List<String> =
+                  Build.SUPPORTED_ABIS.filter { a ->
+                      runCatching { ctx.assets.open("vnxmem-$a").close(); true }.getOrDefault(false)
+                  }
+
+              fun install(ctx: Context): String {
+                  val abi = abis(ctx).firstOrNull()
+                      ?: return "! no helper for ${Build.SUPPORTED_ABIS.joinToString()}"
+                  synchronized(installed) {
+                      if (installed.contains(abi)) return "helper already installed ($abi)"
+                      val bytes = ctx.assets.open("vnxmem-$abi").use { it.readBytes() }
+                      val script = "mkdir -p $DIR; cat > $BIN; chmod 755 $BIN; " +
+                          "test \"\$(stat -c%s $BIN)\" = \"${bytes.size}\" && test -x $BIN && echo OK"
+                      val p = runCatching {
+                          Shizuku.newProcess(arrayOf("sh", "-c", script), null, null)
+                      }.getOrNull() ?: return "! shizuku.newProcess returned null"
+                      try {
+                          p.outputStream.use { it.write(bytes) }
+                      } catch (e: Exception) {
+                          return "! write failed: ${e.message}"
+                      }
+                      val out = p.inputStream.readBytes().toString(Charsets.UTF_8).trim()
+                      val code = p.waitFor()
+                      if (code != 0 || !out.contains("OK"))
+                          return "! install failed exit=$code out=$out (expected ${bytes.size} bytes)"
+                      installed.add(abi)
+                      return "helper installed ($abi, ${bytes.size} bytes)"
+                  }
+              }
+
+              private fun digits(s: String): Boolean = s.isNotEmpty() && s.all { it.isDigit() }
+
+              fun pid(): String {
+                  for (pkg in listOf("com.dts.freefireth", "com.dts.freefiremax")) {
+                      val direct = Shell.exec("pidof $pkg").trim()
+                          .split(" ").firstOrNull().orEmpty().trim()
+                      if (digits(direct)) return direct
+
+                      val ps = Shell.exec("ps -A -o PID,ARGS 2>/dev/null")
+                      val line = ps.lines().firstOrNull { it.trim().endsWith(" $pkg") }
+                      val viaPs = line?.trim()?.split(" ")?.firstOrNull().orEmpty()
+                      if (digits(viaPs)) return viaPs
+                  }
+                  return ""
+              }
+
+              fun probe(pid: String) = if (pid.isBlank()) "! no pid" else Shell.exec("$BIN probe $pid")
+              fun mods(pid: String) = if (pid.isBlank()) "! no pid" else Shell.exec("$BIN mods $pid")
+              fun tracer(pid: String) = if (pid.isBlank()) "! no pid" else Shell.exec("$BIN tracerpid $pid")
+
+              fun read(pid: String, a: String, n: String) =
+                  if (pid.isBlank()) "! no pid" else Shell.exec("$BIN read $pid $a $n")
+
+              fun write(pid: String, a: String, hex: String) =
+                  if (pid.isBlank()) "! no pid" else Shell.exec("$BIN write $pid $a $hex")
+
+              fun findm(pid: String, mod: String, t: String, p: String) =
+                  if (pid.isBlank()) "! no pid" else Shell.exec("$BIN findm $pid $mod $t '$p'", 240_000L)
+
+              fun fnew(pid: String, mod: String, t: String, v: String) =
+                  if (pid.isBlank()) "! no pid" else Shell.exec("$BIN fnew $pid $mod $t $v", 240_000L)
+
+              fun fnext(pid: String, t: String, v: String) =
+                  if (pid.isBlank()) "! no pid" else Shell.exec("$BIN fnext $pid $t $v")
+
+              fun frange(pid: String, t: String, lo: String, hi: String) =
+                  if (pid.isBlank()) "! no pid" else Shell.exec("$BIN frange $pid $t $lo $hi")
+
+              fun fshow(pid: String, limit: String) = Shell.exec("$BIN fshow $pid $limit")
+
+              fun fset(pid: String, idx: String, t: String, v: String) =
+                  if (pid.isBlank()) "! no pid" else Shell.exec("$BIN fset $pid $idx $t $v")
+
+              fun fsnap(pid: String) = if (pid.isBlank()) "! no pid" else Shell.exec("$BIN fsnap $pid")
+              fun frestore(pid: String) = if (pid.isBlank()) "! no pid" else Shell.exec("$BIN frestore $pid")
+              fun freset() = Shell.exec("$BIN freset")
+
+              fun aim(pid: String, cam: String, me: String, arr: String, count: String,
+                      stride: String, posoff: String, smooth: String, fov: String,
+                      mode: String, flags: String): String {
+                  if (pid.isBlank()) return "! no pid"
+                  val cmd = "$BIN aim $pid $cam $me $arr $count $stride $posoff $smooth $fov $mode $flags"
+                  Shell.exec("( $cmd ) > $DIR/aim.log 2>&1 < /dev/null & echo started")
+                  return "aim running -> $DIR/aim.log"
+              }
+
+              fun aimStop(): String {
+                  Shell.exec("pkill -f '$BIN aim' 2>/dev/null")
+                  return "aim stopped"
+              }
+
+              fun aimLog() = Shell.exec("tail -n 25 $DIR/aim.log 2>/dev/null || echo '(no log yet)'")
+
+              fun selfTest(ctx: Context, pid: String): String {
+                  val sb = StringBuilder()
+                  var pass = 0
+                  var fail = 0
+                  fun step(name: String, ok: Boolean, detail: String) {
+                      if (ok) pass++ else fail++
+                      sb.append(if (ok) "[PASS] " else "[FAIL] ").append(name)
+                      if (detail.isNotEmpty()) sb.append(" :: ").append(detail.take(120))
+                      sb.append('\n')
+                  }
+
+                  val inst = install(ctx)
+                  step("01 install helper", inst.startsWith("helper"), inst)
+                  if (pid.isBlank()) {
+                      step("02 game pid", false, "Free Fire not running")
+                      return sb.append("\n").append(pass).append(" pass / ")
+                               .append(fail).append(" fail").toString()
+                  }
+                  step("02 game pid", true, pid)
+
+                  val pr = Shell.exec("$BIN probe $pid")
+                  val prLine = pr.lines().firstOrNull { it.startsWith("RESULT") } ?: pr.take(90)
+                  step("03 memory access", pr.contains("RESULT: OK"), prLine)
+
+                  val tp = Shell.exec("$BIN tracerpid $pid").trim()
+                  step("04 tracerpid is 0", tp.endsWith(" 0"), tp)
+
+                  val md = Shell.exec("$BIN mods $pid")
+                  val modCount = md.lines().count { it.isNotBlank() && !it.startsWith("!") }
+                  step("05 list modules", modCount > 3, "$modCount modules")
+
+                  val firstMod = md.lines().firstOrNull()?.trim()?.split(" ")
+                      ?.firstOrNull().orEmpty()
+                  if (firstMod.isNotEmpty()) {
+                      val rdOut = Shell.exec("$BIN read $pid 0x$firstMod 32")
+                      val hex = rdOut.lines().lastOrNull().orEmpty().trim()
+                      step("06 read memory",
+                           hex.length >= 32 && hex.all { it in "0123456789abcdefABCDEF" },
+                           "${hex.length} hex chars")
+                  } else {
+                      step("06 read memory", false, "no module base found")
+                  }
+
+                  val f1 = Shell.exec("$BIN fnew $pid libil2cpp.so f 1.0", 240_000L)
+                  val n1 = Regex("set (\\d+)").find(f1)?.groupValues?.get(1)?.toIntOrNull() ?: -1
+                  step("07 filter new search", n1 > 0, "candidates=$n1")
+
+                  if (n1 > 0) {
+                      val f2 = Shell.exec("$BIN fnext $pid f 1.0")
+                      val n2 = Regex("remaining (\\d+)").find(f2)
+                          ?.groupValues?.get(1)?.toIntOrNull() ?: -1
+                      step("08 filter narrow", n2 in 1..n1, "remaining=$n2")
+
+                      val fs = Shell.exec("$BIN fshow $pid 3")
+                      step("09 filter show", fs.contains("count "), fs.lines().lastOrNull().orEmpty())
+
+                      val sn = Shell.exec("$BIN fsnap $pid")
+                      step("10 snapshot", sn.contains("snapshot saved"), sn)
+
+                      val rs = Shell.exec("$BIN frestore $pid")
+                      step("11 restore (real write)", rs.contains("restored"), rs)
+                  } else {
+                      step("08 filter narrow", false, "no candidates")
+                      step("09 filter show", false, "skipped")
+                      step("10 snapshot", false, "skipped")
+                      step("11 restore (real write)", false, "skipped")
+                  }
+
+                  Shell.exec("$BIN freset")
+                  step("12 filter reset", true, "cleared")
+
+                  return sb.append("\n").append(pass).append(" pass / ")
+                           .append(fail).append(" fail").toString()
+              }
+          }
+          EOF
+
+            cat > app/src/main/java/ai/venice/vnx/OverlaySvc.kt <<'EOF'
+          package ai.venice.vnx
+
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.graphics.Typeface
+          import android.os.Build
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.os.PowerManager
+          import android.view.Gravity
+          import android.view.WindowManager
+          import android.widget.TextView
+          import androidx.core.app.NotificationCompat
+
+          class OverlaySvc : Service() {
+              companion object {
+                  @Volatile var running = false
+                  @Volatile var status = "VNX APEX"
+                  private const val CH = "vnx"
+              }
+
+              private var wm: WindowManager? = null
+              private var hud: TextView? = null
+              private var orb: TextView? = null
+              private var wake: PowerManager.WakeLock? = null
+              private val ui = Handler(Looper.getMainLooper())
+              private val tick = object : Runnable {
+                  override fun run() { hud?.text = status; ui.postDelayed(this, 1000L) }
+              }
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  running = true
+
+                  val pm = getSystemService(POWER_SERVICE) as PowerManager
+                  wake = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "vnx:aim").also { it.acquire() }
+
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+                      nm.createNotificationChannel(
+                          NotificationChannel(CH, "VNX", NotificationManager.IMPORTANCE_LOW))
+                  }
+                  val n = NotificationCompat.Builder(this, CH)
+                      .setContentTitle("VNX Apex")
+                      .setContentText("overlay + aim active")
+                      .setSmallIcon(android.R.drawable.ic_menu_compass)
+                      .setOngoing(true)
+                      .setPriority(NotificationCompat.PRIORITY_LOW)
+                      .build()
+
+                  if (Build.VERSION.SDK_INT >= 34) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                  } else {
+                      startForeground(1, n)
+                  }
+                  mount()
+                  ui.post(tick)
+              }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun mount() {
+                  val w = getSystemService(WINDOW_SERVICE) as WindowManager
+                  wm = w
+                  val type = if (Build.VERSION.SDK_INT >= 26)
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                  else
+                      WindowManager.LayoutParams.TYPE_PHONE
+                  val flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                              WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                              WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+
+                  val h = TextView(this).apply {
+                      text = status
+                      setTextColor(Color.parseColor("#39FF88"))
+                      textSize = 11f
+                      typeface = Typeface.MONOSPACE
+                      setBackgroundColor(Color.parseColor("#99000000"))
+                      setPadding(dp(8), dp(4), dp(8), dp(4))
+                  }
+                  val o = TextView(this).apply {
+                      text = "VNX"
+                      setTextColor(Color.parseColor("#39FF88"))
+                      textSize = 10f
+                      typeface = Typeface.MONOSPACE
+                      gravity = Gravity.CENTER
+                      setBackgroundColor(Color.parseColor("#66000000"))
+                  }
+                  hud = h
+                  orb = o
+
+                  val hp = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      type, flags, PixelFormat.TRANSLUCENT
+                  ).apply { gravity = Gravity.TOP or Gravity.START; x = dp(12); y = dp(56) }
+
+                  val op = WindowManager.LayoutParams(
+                      dp(72), dp(72), type, flags, PixelFormat.TRANSLUCENT
+                  ).apply { gravity = Gravity.TOP or Gravity.END; x = dp(12); y = dp(56) }
+
+                  runCatching { w.addView(h, hp) }
+                  runCatching { w.addView(o, op) }
+              }
+
+              override fun onDestroy() {
+                  running = false
+                  ui.removeCallbacks(tick)
+                  val w = wm
+                  val h = hud
+                  val o = orb
+                  if (w != null && h != null) runCatching { w.removeView(h) }
+                  if (w != null && o != null) runCatching { w.removeView(o) }
+                  runCatching { wake?.takeIf { it.isHeld }?.release() }
+                  super.onDestroy()
+              }
+          }
+          EOF
+
+            cat > app/src/main/java/ai/venice/vnx/ReportCleaner.kt <<'EOF'
+          package ai.venice.vnx
+
+          object ReportCleaner {
+              private val PKGS = listOf("com.dts.freefireth", "com.dts.freefiremax")
+
+              fun run(): String {
+                  val sb = StringBuilder()
+                  var found = false
+                  for (pkg in PKGS) {
+                      if (!Shell.exec("pm path $pkg").contains("package:")) continue
+                      found = true
+                      Shell.exec("am force-stop $pkg")
+                      for (root in listOf("/data/user/0/$pkg", "/data/data/$pkg")) {
+                          Shell.exec(
+                              "rm -f $root/files/*.log 2>/dev/null; " +
+                              "rm -rf $root/cache/* 2>/dev/null; " +
+                              "rm -rf $root/files/report* 2>/dev/null"
+                          )
+                      }
+                      Shell.exec("monkey -p $pkg -c android.intent.category.LAUNCHER 1 > /dev/null 2>&1")
+                      sb.append("$pkg cleared + relaunched\n")
+                  }
+                  return if (found) sb.toString().trim() else "! Free Fire not installed"
+              }
+          }
+          EOF
+
+            cat > app/src/main/java/ai/venice/vnx/MainActivity.kt <<'EOF'
+          package ai.venice.vnx
+
+          import android.Manifest
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.activity.enableEdgeToEdge
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontFamily
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.input.PasswordVisualTransformation
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.core.content.ContextCompat
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+
+          private val BG = Color(0xFF0B0E13)
+          private val CARD = Color(0xFF141922)
+          private val ACC = Color(0xFF39FF88)
+          private val DIM = Color(0xFF7A8798)
+          private val RED = Color(0xFFFF3D71)
+          private val FG = Color(0xFFE6EDF5)
+
+          class MainActivity : ComponentActivity() {
+              private var askedOverlay = false
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  enableEdgeToEdge()
+                  Auth.seed(this)
+                  ShizukuGate.attach(this)
+                  setContent {
+                      MaterialTheme(
+                          colorScheme = darkColorScheme(
+                              background = BG, surface = CARD,
+                              primary = ACC, onPrimary = BG, onSurface = FG
+                          )
+                      ) {
+                          Surface(Modifier.fillMaxSize().background(BG), color = BG) { Root() }
+                      }
+                  }
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  if (!Settings.canDrawOverlays(this) && !askedOverlay) {
+                      askedOverlay = true
+                      runCatching {
+                          startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                              Uri.parse("package:$packageName")))
+                      }
+                  }
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
+                          PackageManager.PERMISSION_GRANTED) {
+                      runCatching { requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 7) }
+                  }
+                  if (Settings.canDrawOverlays(this) && !OverlaySvc.running) {
+                      runCatching {
+                          ContextCompat.startForegroundService(this, Intent(this, OverlaySvc::class.java))
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun Btn(label: String, color: Color = ACC, onClick: () -> Unit) {
+              Button(
+                  onClick = onClick,
+                  modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                  colors = ButtonDefaults.buttonColors(containerColor = color, contentColor = BG)
+              ) { Text(label, fontSize = 12.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp) }
+          }
+
+          @Composable
+          private fun Field(label: String, value: String, hint: String = "", onChange: (String) -> Unit) {
+              Column(Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
+                  Text(label, color = DIM, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+                  OutlinedTextField(
+                      value = value,
+                      onValueChange = onChange,
+                      singleLine = true,
+                      modifier = Modifier.fillMaxWidth(),
+                      placeholder = { if (hint.isNotEmpty()) Text(hint, color = DIM, fontSize = 11.sp) },
+                      textStyle = LocalTextStyle.current.copy(
+                          fontFamily = FontFamily.Monospace, fontSize = 13.sp, color = FG)
+                  )
+              }
+          }
+
+          @Composable
+          private fun Head(t: String) {
+              Text(t, color = ACC, fontSize = 11.sp, fontFamily = FontFamily.Monospace,
+                  letterSpacing = 2.sp, modifier = Modifier.padding(top = 12.dp, bottom = 2.dp))
+          }
+
+          @Composable
+          private fun Root() {
+              val ctx = LocalContext.current
+              var shiz by remember { mutableStateOf(ShizukuGate.granted()) }
+              var inSession by remember { mutableStateOf(Auth.loggedIn(ctx)) }
+
+              LaunchedEffect(Unit) {
+                  while (true) { shiz = ShizukuGate.granted(); delay(1200L) }
+              }
+
+              if (!shiz) {
+                  Column(Modifier.fillMaxSize().safeDrawingPadding().padding(24.dp),
+                      verticalArrangement = Arrangement.Center,
+                      horizontalAlignment = Alignment.CenterHorizontally) {
+                      Text("VNX APEX", color = ACC, fontSize = 26.sp,
+                          fontWeight = FontWeight.Bold, letterSpacing = 4.sp)
+                      Spacer(Modifier.height(10.dp))
+                      Text("Shizuku is not running", color = DIM, fontSize = 12.sp)
+                      Spacer(Modifier.height(6.dp))
+                      Text("start Shizuku, then tap below", color = DIM, fontSize = 11.sp)
+                      Spacer(Modifier.height(24.dp))
+                      Btn("REQUEST SHIZUKU") { ShizukuGate.request() }
+                  }
+                  return
+              }
+
+              if (!inSession) { LoginScreen { inSession = true }; return }
+              Panel { inSession = false }
+          }
+
+          @Composable
+          private fun LoginScreen(done: () -> Unit) {
+              val ctx = LocalContext.current
+              var u by remember { mutableStateOf("venice") }
+              var p by remember { mutableStateOf("") }
+              var err by remember { mutableStateOf("") }
+
+              Column(Modifier.fillMaxSize().safeDrawingPadding().padding(24.dp),
+                  verticalArrangement = Arrangement.Center) {
+                  Text("VNX APEX", color = ACC, fontSize = 24.sp,
+                      fontWeight = FontWeight.Bold, letterSpacing = 4.sp)
+                  Spacer(Modifier.height(20.dp))
+                  Field("USER", u) { u = it }
+                  Column(Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
+                      Text("PASS", color = DIM, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+                      OutlinedTextField(
+                          value = p, onValueChange = { p = it }, singleLine = true,
+                          visualTransformation = PasswordVisualTransformation(),
+                          modifier = Modifier.fillMaxWidth(),
+                          textStyle = LocalTextStyle.current.copy(
+                              fontFamily = FontFamily.Monospace, fontSize = 13.sp, color = FG))
+                  }
+                  Spacer(Modifier.height(10.dp))
+                  Btn("ENTER") {
+                      if (Auth.verify(ctx, u, p)) { Auth.login(ctx); done() } else err = "bad credentials"
+                  }
+                  if (err.isNotEmpty()) {
+                      Spacer(Modifier.height(8.dp))
+                      Text(err, color = RED, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                  }
+              }
+          }
+
+          private val TABS = listOf("SETUP", "AIM", "SCAN", "FILTER")
+
+          @Composable
+          private fun TabBar(sel: Int, onSel: (Int) -> Unit) {
+              Row(Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
+                  TABS.forEachIndexed { i, t ->
+                      val on = i == sel
+                      Box(
+                          Modifier.weight(1f).padding(horizontal = 2.dp)
+                              .background(if (on) ACC else CARD)
+                              .clickable { onSel(i) }
+                              .padding(vertical = 8.dp),
+                          contentAlignment = Alignment.Center
+                      ) {
+                          Text(t, color = if (on) BG else DIM, fontSize = 10.sp,
+                              fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun Panel(onLogout: () -> Unit) {
+              val ctx = LocalContext.current
+              val scope = rememberCoroutineScope()
+
+              var tab by remember { mutableStateOf(0) }
+              var pid by remember { mutableStateOf("") }
+              var cam by remember { mutableStateOf("0x0") }
+              var me by remember { mutableStateOf("0x0") }
+              var arr by remember { mutableStateOf("0x0") }
+              var count by remember { mutableStateOf("64") }
+              var stride by remember { mutableStateOf("8") }
+              var posoff by remember { mutableStateOf("0x0") }
+              var smooth by remember { mutableStateOf("0.35") }
+              var fov by remember { mutableStateOf("60") }
+              var mode by remember { mutableStateOf("e") }
+              var flags by remember { mutableStateOf("0") }
+
+              var module by remember { mutableStateOf("libil2cpp.so") }
+              var type by remember { mutableStateOf("f") }
+              var pattern by remember { mutableStateOf("") }
+              var addr by remember { mutableStateOf("0x0") }
+              var len by remember { mutableStateOf("64") }
+              var value by remember { mutableStateOf("0") }
+              var idx by remember { mutableStateOf("0") }
+              var lo by remember { mutableStateOf("0") }
+              var hi by remember { mutableStateOf("100") }
+
+              var log by remember { mutableStateOf("ready") }
+              var busy by remember { mutableStateOf(false) }
+
+              fun run(block: suspend () -> String) {
+                  scope.launch {
+                      busy = true
+                      log = withContext(Dispatchers.IO) {
+                          runCatching { block() }.getOrElse { "! ${it.message}" }
+                      }
+                      busy = false
+                  }
+              }
+
+              Column(Modifier.fillMaxSize().safeDrawingPadding()
+                  .verticalScroll(rememberScrollState()).padding(16.dp)) {
+                  Row(Modifier.fillMaxWidth(),
+                      horizontalArrangement = Arrangement.SpaceBetween,
+                      verticalAlignment = Alignment.CenterVertically) {
+                      Text("VNX APEX", color = ACC, fontSize = 20.sp,
+                          fontWeight = FontWeight.Bold, letterSpacing = 3.sp)
+                      Text(if (busy) "WORKING" else "IDLE",
+                          color = if (busy) ACC else DIM,
+                          fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                  }
+                  TabBar(tab) { tab = it }
+
+                  if (tab == 0) {
+                      Head("1 - PREPARE")
+                      Btn("INSTALL HELPER") { run { Native.install(ctx) } }
+                      Btn("FIND GAME PID") {
+                          run {
+                              val v = Native.pid()
+                              if (v.isNotEmpty()) pid = v
+                              if (v.isEmpty()) "! Free Fire not running" else "pid=$v"
+                          }
+                      }
+                      Btn("RUN FULL SELF TEST") { run { Native.selfTest(ctx, pid) } }
+                      Btn("TEST MEMORY ACCESS") { run { Native.probe(pid) } }
+                      Btn("CHECK ANTI-CHEAT TRACER") { run { Native.tracer(pid) } }
+                      Btn("LIST MODULES") { run { Native.mods(pid) } }
+                      Head("OVERLAY")
+                      Btn("START OVERLAY") {
+                          run {
+                              ContextCompat.startForegroundService(ctx, Intent(ctx, OverlaySvc::class.java))
+                              "overlay started"
+                          }
+                      }
+                      Btn("CLEAR FF REPORTS + RELAUNCH", DIM) { run { ReportCleaner.run() } }
+                      Head("PID")
+                      Field("PID", pid) { pid = it }
+                  }
+
+                  if (tab == 1) {
+                      Head("AIM CONFIG")
+                      Field("CAMERA ADDRESS", cam) { cam = it }
+                      Row(Modifier.fillMaxWidth()) {
+                          Box(Modifier.weight(1f)) { Field("LOCAL PLAYER", me) { me = it } }
+                          Spacer(Modifier.width(8.dp))
+                          Box(Modifier.weight(1f)) { Field("ENTITY ARRAY", arr) { arr = it } }
+                      }
+                      Row(Modifier.fillMaxWidth()) {
+                          Box(Modifier.weight(1f)) { Field("COUNT", count) { count = it } }
+                          Spacer(Modifier.width(8.dp))
+                          Box(Modifier.weight(1f)) { Field("STRIDE 4 or 8", stride) { stride = it } }
+                      }
+                      Row(Modifier.fillMaxWidth()) {
+                          Box(Modifier.weight(1f)) { Field("POS OFFSET", posoff) { posoff = it } }
+                          Spacer(Modifier.width(8.dp))
+                          Box(Modifier.weight(1f)) { Field("SMOOTH 0-1", smooth) { smooth = it } }
+                      }
+                      Row(Modifier.fillMaxWidth()) {
+                          Box(Modifier.weight(1f)) { Field("FOV m (0=off)", fov) { fov = it } }
+                          Spacer(Modifier.width(8.dp))
+                          Box(Modifier.weight(1f)) { Field("MODE e|q", mode) { mode = it } }
+                      }
+                      Field("FLAGS 0-7", flags) { flags = it }
+                      Spacer(Modifier.height(8.dp))
+                      Btn("START AIM") {
+                          run {
+                              OverlaySvc.status = "AIM ON"
+                              Native.aim(pid, cam, me, arr, count, stride, posoff, smooth, fov, mode, flags)
+                          }
+                      }
+                      Btn("STOP AIM", RED) { run { OverlaySvc.status = "VNX APEX"; Native.aimStop() } }
+                      Btn("AIM LOG", DIM) { run { Native.aimLog() } }
+                  }
+
+                  if (tab == 2) {
+                      Head("PATTERN SCAN")
+                      Field("MODULE", module) { module = it }
+                      Row(Modifier.fillMaxWidth()) {
+                          Box(Modifier.weight(1f)) { Field("TYPE b/w/f/d/h", type) { type = it } }
+                          Spacer(Modifier.width(8.dp))
+                          Box(Modifier.weight(1f)) { Field("PATTERN", pattern, "48 8B ?? 05") { pattern = it } }
+                      }
+                      Btn("FIND IN MODULE") { run { Native.findm(pid, module, type, pattern) } }
+                      Head("DIRECT MEMORY")
+                      Row(Modifier.fillMaxWidth()) {
+                          Box(Modifier.weight(1f)) { Field("ADDRESS", addr) { addr = it } }
+                          Spacer(Modifier.width(8.dp))
+                          Box(Modifier.weight(1f)) { Field("LENGTH", len) { len = it } }
+                      }
+                      Btn("READ", DIM) { run { Native.read(pid, addr, len) } }
+                      Field("HEX BYTES", value, "00 00 80 3f") { value = it }
+                      Btn("WRITE", DIM) { run { Native.write(pid, addr, value) } }
+                  }
+
+                  if (tab == 3) {
+                      Head("VALUE FILTER")
+                      Text("b byte  w word  f float  d double",
+                          color = DIM, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+                      Spacer(Modifier.height(6.dp))
+                      Field("MODULE", module) { module = it }
+                      Row(Modifier.fillMaxWidth()) {
+                          Box(Modifier.weight(1f)) { Field("TYPE", type) { type = it } }
+                          Spacer(Modifier.width(8.dp))
+                          Box(Modifier.weight(1f)) { Field("VALUE", value) { value = it } }
+                      }
+                      Btn("NEW SEARCH") { run { Native.fnew(pid, module, type, value) } }
+                      Btn("FILTER EQUAL") { run { Native.fnext(pid, type, value) } }
+                      Row(Modifier.fillMaxWidth()) {
+                          Box(Modifier.weight(1f)) { Field("MIN", lo) { lo = it } }
+                          Spacer(Modifier.width(8.dp))
+                          Box(Modifier.weight(1f)) { Field("MAX", hi) { hi = it } }
+                      }
+                      Btn("FILTER RANGE") { run { Native.frange(pid, type, lo, hi) } }
+                      Btn("SHOW RESULTS") { run { Native.fshow(pid, "40") } }
+                      Row(Modifier.fillMaxWidth()) {
+                          Box(Modifier.weight(1f)) { Field("INDEX", idx) { idx = it } }
+                          Spacer(Modifier.width(8.dp))
+                          Box(Modifier.weight(1f)) { Field("VALUE", value) { value = it } }
+                      }
+                      Btn("WRITE INDEX") { run { Native.fset(pid, idx, type, value) } }
+                      Btn("SNAPSHOT", DIM) { run { Native.fsnap(pid) } }
+                      Btn("RESTORE SNAPSHOT", DIM) { run { Native.frestore(pid) } }
+                      Btn("RESET FILTER", DIM) { run { Native.freset() } }
+                  }
+
+                  Head("OUTPUT")
+                  val shown = if (log.length > 3500)
+                      "..." + (log.length - 3500) + " earlier chars\n" + log.takeLast(3500)
+                  else log
+                  Text(shown, color = DIM, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+
+                  Spacer(Modifier.height(16.dp))
+                  Btn("LOG OUT", DIM) { Auth.logout(ctx); onLogout() }
+                  Spacer(Modifier.height(24.dp))
+              }
+          }
+          EOF
+          } 2>&1 | tee "$LOGDIR/03-scaffold.log"
+
+      - name: Verify C source compiles
+        run: |
+          set -x
+          set -o pipefail
+          {
+            gcc -O2 -Wall -o /tmp/vnxmem_host app/src/main/cpp/vnxmem.c -lm
+            /tmp/vnxmem_host help > /tmp/vnxmem_help.txt
+            head -3 /tmp/vnxmem_help.txt
+            echo "C source OK"
+          } 2>&1 | tee "$LOGDIR/04-verify-c.log"
+
+      - name: Build native helper
+        run: |
+          set -x
+          set -o pipefail
+          {
+            set -euo pipefail
+            NDK="${ANDROID_HOME:?ANDROID_HOME unset}/ndk/${NDK_VERSION}"
+            TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+            OUT=app/src/main/assets
+            mkdir -p "$OUT"
+            build() {
+              local abi="$1" triple="$2"
+              "$TC/${triple}24-clang" -O2 -static -fPIE -pie -ffunction-sections \
+                -fdata-sections -Wl,--gc-sections -Wall \
+                -o "$OUT/vnxmem-$abi" app/src/main/cpp/vnxmem.c -lm
+              "$TC/llvm-strip" "$OUT/vnxmem-$abi"
+              echo "built $abi -> $(stat -c%s "$OUT/vnxmem-$abi") bytes"
+            }
+            build arm64-v8a   aarch64-linux-android
+            build armeabi-v7a armv7a-linux-androideabi
+            build x86_64      x86_64-linux-android
+            build x86         i686-linux-android
+            for a in arm64-v8a armeabi-v7a x86_64 x86; do
+              test -s "$OUT/vnxmem-$a" || { echo "::error::missing $a"; exit 1; }
+            done
+          } 2>&1 | tee "$LOGDIR/05-native.log"
+
+      - name: Assemble debug + release
+        run: |
+          set -x
+          set -o pipefail
+          gradle --no-daemon --console=plain --warning-mode=all --stacktrace \
+            assembleDebug assembleRelease 2>&1 | tee "$LOGDIR/06-gradle.log"
+
+      - name: Build error dump
+        if: failure()
+        run: |
+          set -x
+          echo "=========== STEP LOGS (tail) ==========="
+          for f in "$LOGDIR"/*.log; do
+            [ -f "$f" ] || continue
+            echo "----- $f -----"
+            tail -n 120 "$f"
+          done
+          echo "=========== END ==========="
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: ${{ runner.temp }}/logs/**
+          if-no-files-found: warn
+
+      - name: Upload APK
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vnx-apex-apk
+          path: app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
