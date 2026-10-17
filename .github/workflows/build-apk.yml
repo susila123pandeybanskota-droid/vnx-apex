@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  LOGDIR: ${{ runner.temp }}/logs
+  LOGDIR: build-logs
   NDK_VERSION: 26.1.10909125
 
 jobs:
@@ -114,6 +114,9 @@ jobs:
             cat > app/proguard-rules.pro <<'EOF'
           -keep class rikka.shizuku.** { *; }
           -keep class moe.shizuku.** { *; }
+          -keepclassmembers class rikka.shizuku.Shizuku {
+              static *** newProcess(...);
+          }
           -dontwarn rikka.shizuku.**
           -dontwarn moe.shizuku.**
           -dontwarn androidx.compose.**
@@ -336,12 +339,35 @@ jobs:
               private val lock = Any()
               private var proc: Process? = null
 
+              private val newProcessMethod by lazy {
+                  runCatching {
+                      Shizuku::class.java.getDeclaredMethod(
+                          "newProcess",
+                          Array<String>::class.java,
+                          Array<String>::class.java,
+                          String::class.java
+                      ).apply { isAccessible = true }
+                  }.getOrNull()
+              }
+
+              fun spawn(cmd: Array<String>): Process? {
+                  val m = newProcessMethod ?: return null
+                  return runCatching {
+                      m.invoke(null, *arrayOf<Any?>(cmd, null, null)) as? Process
+                  }.getOrNull()
+              }
+
+              fun alive(p: Process): Boolean {
+                  val r = runCatching { p.javaClass.getMethod("alive").invoke(p) as Boolean }
+                  if (r.isSuccess) return r.getOrThrow()
+                  return try { p.exitValue(); false } catch (e: IllegalThreadStateException) { true }
+              }
+
               private fun warm(): Process? {
-                  proc?.let { if (it.isAlive) return it }
+                  proc?.let { if (alive(it)) return it }
                   proc = null
                   if (!ShizukuGate.granted()) return null
-                  val p = runCatching { Shizuku.newProcess(arrayOf("sh"), null, null) }.getOrNull()
-                      ?: return null
+                  val p = spawn(arrayOf("sh")) ?: return null
                   proc = p
                   runCatching {
                       p.outputStream.write("echo ready\n".toByteArray())
@@ -383,7 +409,7 @@ jobs:
                               val i = s.indexOf(MARK)
                               if (i >= 0) return@synchronized s.substring(0, i).trim()
                           } else {
-                              if (!p.isAlive) {
+                              if (!alive(p)) {
                                   drop()
                                   val s = sb.toString().trim()
                                   return@synchronized if (s.isEmpty()) "! shell closed" else s
@@ -443,7 +469,6 @@ jobs:
 
           import android.content.Context
           import android.os.Build
-          import rikka.shizuku.Shizuku
 
           object Native {
               const val DIR = "/data/local/tmp/vnx"
@@ -463,9 +488,8 @@ jobs:
                       val bytes = ctx.assets.open("vnxmem-$abi").use { it.readBytes() }
                       val script = "mkdir -p $DIR; cat > $BIN; chmod 755 $BIN; " +
                           "test \"\$(stat -c%s $BIN)\" = \"${bytes.size}\" && test -x $BIN && echo OK"
-                      val p = runCatching {
-                          Shizuku.newProcess(arrayOf("sh", "-c", script), null, null)
-                      }.getOrNull() ?: return "! shizuku.newProcess returned null"
+                      val p = Shell.spawn(arrayOf("sh", "-c", script))
+                          ?: return "! cannot spawn sh (Shizuku binder not ready?)"
                       try {
                           p.outputStream.use { it.write(bytes) }
                       } catch (e: Exception) {
@@ -795,6 +819,7 @@ jobs:
           import androidx.compose.foundation.rememberScrollState
           import androidx.compose.foundation.verticalScroll
           import androidx.compose.material3.*
+          import androidx.compose.material3.LocalTextStyle
           import androidx.compose.runtime.*
           import androidx.compose.ui.Alignment
           import androidx.compose.ui.Modifier
@@ -1217,7 +1242,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build-logs
-          path: ${{ runner.temp }}/logs/**
+          path: build-logs/**
           if-no-files-found: warn
 
       - name: Upload APK
